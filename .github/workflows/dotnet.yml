@@ -1,0 +1,150 @@
+# This workflow will build a .NET project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
+
+name: Build and Release Mod
+
+on:
+  push:
+    branches: 
+      - "main"
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Check version
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C.UTF-8
+          export LANG=C.UTF-8
+
+          die() {
+            local MSG="$1"
+            {
+              printf 'version=\n'
+              printf 'latest_tag=\n'
+              printf 'project_name=\n'
+              printf 'should_release=false\n'
+            } >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$MSG" >&2
+            exit 1
+          }
+
+          PROJECT_NAME=$(ls *.csproj | head -n1 | xargs -n1 basename -s .csproj)
+
+          FILE="./main.cs"
+          if [ ! -f "$FILE" ]; then
+            die "No $FILE found; skipping release."
+          fi
+
+          ATTR=$(grep -m1 -Po '\[BepInPlugin\([^)]*\)\]' "$FILE" || true)
+          if [ -z "$ATTR" ]; then
+            die "Could not find BepInPlugin attribute"
+          else
+            ARG3=$(printf '%s' "$ATTR" | grep -Po '(?:[^,]+,\s*){2}\K([^)]+)' || true)
+            if [ -z "$ARG3" ]; then
+              die "Cannot find BepInPlugin argument 3 (version)"
+            fi
+            ARG3="$(printf '%s' "$ARG3" | xargs)"
+
+            if [[ "$ARG3" == \"*\" ]]; then
+              VER="${ARG3%\"}"
+              VER="${VER#\"}"
+            else
+              VER=$(grep -m1 -Po "\b$ARG3\b[\s=]+\"\K[^\"]+" "$FILE" || true)
+              if [ -z "$VER" ]; then
+                die "Could not find BepInPlugin version variable assignment matching version formatting"
+              fi
+            fi
+          fi
+
+          VERSION_TEST_REGEX='^[0-9]+(\.[0-9]+)*$'
+          if [[ ! "$VER" =~ $VERSION_TEST_REGEX ]]; then
+            die "Invalid version format: $VER"
+          fi
+
+          VERSION_ZERO_REGEX='^0+(\.0+)*$'
+          if [[ "$VER" =~ $VERSION_ZERO_REGEX ]]; then
+            {
+              printf 'version=%s\n' "$VER"
+              printf 'latest_tag=\n'
+              printf 'project_name=%s\n' "$PROJECT_NAME"
+              printf 'should_release=false\n'
+            } >> "$GITHUB_OUTPUT"
+            echo "Version is zero (no release): $VER" >&2
+            exit 0
+          fi
+
+          git fetch --tags --force
+          LATEST_TAG_RAW="$(git tag | grep -E '^v?[0-9]+(\.[0-9]+)*$' | sort -V | tail -n1 || true)"
+          if [ -z "$LATEST_TAG_RAW" ]; then
+            LATEST_TAG=""
+            SHOULD_RELEASE=true
+          else
+            LATEST_TAG="${LATEST_TAG_RAW#v}"
+            
+            NEWEST="$(printf '%s\n%s\n' "$LATEST_TAG" "$VER" | sort -V | tail -n1)"
+            if [ "$NEWEST" = "$VER" ] && [ "$VER" != "$LATEST_TAG" ]; then
+              SHOULD_RELEASE=true
+            else
+              SHOULD_RELEASE=false
+            fi
+            
+            OLDEST="$(printf '%s\n%s\n' "$LATEST_TAG" "$VER" | sort -V | head -n1)"
+            if [ "$OLDEST" = "$VER" ] && [ "$VER" != "$LATEST_TAG" ]; then
+              die "Version downgrade has been caught: $VER is older than latest tag $LATEST_TAG"
+            fi
+          fi
+
+          {
+            printf 'version=%s\n' "$VER"
+            printf 'latest_tag=%s\n' "$LATEST_TAG"
+            printf 'project_name=%s\n' "$PROJECT_NAME"
+            printf 'should_release=%s\n' "$SHOULD_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build mod
+        if: steps.check.outputs.should_release == 'true'
+        id: build
+        env:
+          PROJECT_NAME: ${{ steps.check.outputs.project_name }}
+        shell: bash
+        run: |
+          dotnet build -c Release
+          ASSET_PATH=$(find . -type f -iname "$PROJECT_NAME.dll" | head -n1)
+          if [ -z "$ASSET_PATH" ]; then
+            echo "Build DLL not found!" >&2
+            exit 1
+          fi
+          echo "asset_path=$ASSET_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Create Github Release
+        if: steps.check.outputs.should_release == 'true'
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: v${{ steps.check.outputs.version }}
+          release_name: Release v${{ steps.check.outputs.version }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Asset
+        if: steps.check.outputs.should_release == 'true'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.build.outputs.asset_path }}
+          asset_name: ${{ steps.check.outputs.project_name }}-v${{ steps.check.outputs.version }}.dll
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
