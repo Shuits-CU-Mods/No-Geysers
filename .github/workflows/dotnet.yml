@@ -31,29 +31,61 @@ jobs:
             {
               printf 'version=\n'
               printf 'latest_tag=\n'
-              printf 'project_name=\n'
+              printf 'assembly_name=\n'
               printf 'should_release=false\n'
             } >> "$GITHUB_OUTPUT"
             printf '%s\n' "$MSG" >&2
             exit 1
           }
 
-          PROJECT_NAME=$(ls *.csproj | head -n1 | xargs -n1 basename -s .csproj)
-
-          FILE="./main.cs"
-          if [ ! -f "$FILE" ]; then
-            die "No $FILE found; skipping release."
+          PROJECT_FILE=$(ls *.csproj | head -n1 || true)
+          if [ -z "$PROJECT_FILE" ]; then
+            die "No .csproj file could be found"
           fi
+          printf 'Target project file: %s\n' "$PROJECT_FILE" >&2
+
+          ASSEMBLY_NAME=$(dotnet msbuild "$PROJECT_FILE" -nologo -p:Configuration=Release -getProperty:AssemblyName | tr -d '\r')
+          if [ -z "$ASSEMBLY_NAME" ]; then
+            die "Assembly name could not be extracted from project file $PROJECT_FILE"
+          fi
+          printf 'Assembly name: %s\n' "$ASSEMBLY_NAME" >&2
+
+          HINT_PATHS=$(grep -Po '<HintPath>\K[^<]+' "$PROJECT_FILE" || true)
+          if [ -z "$HINT_PATHS" ]; then
+            printf 'No HintPath properties found in csproj\n' >&2
+          else
+            while read -r HINT; do
+              DIR=$(dirname "$HINT")
+
+              if [ ! -d "$DIR" ]; then
+                die "Referenced directory does not exist: $DIR (from $HINT)"
+              fi
+
+              if [ ! -f "$HINT" ]; then
+                die "Referenced assembly does not exist: $HINT"
+              fi
+
+              printf 'Validated reference: %s\n' "$HINT" >&2
+            done <<< "$HINT_PATHS"
+          fi
+
+          FILE="$(grep -rPl '\[BepInPlugin\s*\(' . --include='*.cs' --exclude-dir={.git,bin,obj} | head -n1)"
+          if [ ! -f "$FILE" ]; then
+            die "No file containing BepInPlugin attribute was found"
+          fi
+          printf 'Using plugin source: %s\n' "$FILE" >&2
 
           ATTR=$(grep -m1 -Po '\[BepInPlugin\([^)]*\)\]' "$FILE" || true)
           if [ -z "$ATTR" ]; then
             die "Could not find BepInPlugin attribute"
           else
+            printf 'Detected BepInPlugin attribute: %s\n' "$ATTR" >&2
             ARG3=$(printf '%s' "$ATTR" | grep -Po '(?:[^,]+,\s*){2}\K([^)]+)' || true)
             if [ -z "$ARG3" ]; then
               die "Cannot find BepInPlugin argument 3 (version)"
             fi
             ARG3="$(printf '%s' "$ARG3" | xargs)"
+            printf 'Detected BepInPlugin argument 3 (version): %s\n' "$ARG3" >&2
 
             if [[ "$ARG3" == \"*\" ]]; then
               VER="${ARG3%\"}"
@@ -65,6 +97,7 @@ jobs:
               fi
             fi
           fi
+          printf 'Detected plugin version: %s\n' "$VER" >&2
 
           VERSION_TEST_REGEX='^[0-9]+(\.[0-9]+)*$'
           if [[ ! "$VER" =~ $VERSION_TEST_REGEX ]]; then
@@ -76,12 +109,14 @@ jobs:
             {
               printf 'version=%s\n' "$VER"
               printf 'latest_tag=\n'
-              printf 'project_name=%s\n' "$PROJECT_NAME"
+              printf 'assembly_name=%s\n' "$ASSEMBLY_NAME"
               printf 'should_release=false\n'
             } >> "$GITHUB_OUTPUT"
             echo "Version is zero (no release): $VER" >&2
             exit 0
           fi
+
+          printf 'Version passed RegEx tests\n' >&2
 
           git fetch --tags --force
           LATEST_TAG_RAW="$(git tag | grep -E '^v?[0-9]+(\.[0-9]+)*$' | sort -V | tail -n1 || true)"
@@ -107,7 +142,7 @@ jobs:
           {
             printf 'version=%s\n' "$VER"
             printf 'latest_tag=%s\n' "$LATEST_TAG"
-            printf 'project_name=%s\n' "$PROJECT_NAME"
+            printf 'assembly_name=%s\n' "$ASSEMBLY_NAME"
             printf 'should_release=%s\n' "$SHOULD_RELEASE"
           } >> "$GITHUB_OUTPUT"
 
@@ -115,11 +150,15 @@ jobs:
         if: steps.check.outputs.should_release == 'true'
         id: build
         env:
-          PROJECT_NAME: ${{ steps.check.outputs.project_name }}
+          ASSEMBLY_NAME: ${{ steps.check.outputs.assembly_name }}
         shell: bash
         run: |
           dotnet build -c Release
-          ASSET_PATH=$(find . -type f -iname "$PROJECT_NAME.dll" | head -n1)
+          if [ -d "bin/Release" ]; then
+            ASSET_PATH=$(find bin/Release -type f -name "$ASSEMBLY_NAME.dll" | head -n1)
+          else
+            ASSET_PATH=$(find . -type f -name "$ASSEMBLY_NAME.dll" | head -n1)
+          fi
           if [ -z "$ASSET_PATH" ]; then
             echo "Build DLL not found!" >&2
             exit 1
@@ -144,7 +183,7 @@ jobs:
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ steps.build.outputs.asset_path }}
-          asset_name: ${{ steps.check.outputs.project_name }}-v${{ steps.check.outputs.version }}.dll
+          asset_name: ${{ steps.check.outputs.assembly_name }}-v${{ steps.check.outputs.version }}.dll
           asset_content_type: application/octet-stream
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
